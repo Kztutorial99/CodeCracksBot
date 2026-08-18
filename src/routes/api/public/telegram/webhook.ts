@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { describeFile } from "@/lib/binary-preview";
-import { qwenChat, RE_SYSTEM_PROMPT } from "@/lib/qwen.server";
+import { qwenChat, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
 import {
   deriveTelegramWebhookSecret,
   downloadFile,
@@ -11,13 +11,20 @@ import {
 
 const WELCOME = `CodeCracks — asisten Reverse Engineering (Qwen AI)
 
-Kirim pertanyaan RE apa saja, atau kirim file/kode untuk dianalisa:
+Model dipilih otomatis, kamu tidak perlu memilih:
+- teks kualitas terbaik: qwen3.8-max
+- coding / analisa kode & binary: qwen3-coder-plus
+- gambar / screenshot: qwen3-vl-flash
+
+Kirim pertanyaan RE apa saja, atau kirim file/gambar/kode untuk dianalisa:
 - snippet kode, disasm, hex dump, log debugger
+- screenshot IDA/Ghidra/x64dbg atau UI aplikasi
 - file .txt .c .py .js .asm .bin .exe .elf .dex .apk (maks ~5 MB)
 
 Perintah: /start, /help`;
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
 type TelegramUpdate = {
   update_id?: number;
@@ -29,34 +36,61 @@ type TelegramMessage = {
   chat?: { id?: number };
   text?: string;
   caption?: string;
-  document?: { file_id: string; file_name?: string; file_size?: number };
+  document?: { file_id: string; file_name?: string; file_size?: number; mime_type?: string };
   photo?: { file_id: string; file_size?: number }[];
 };
 
-async function buildPrompt(message: TelegramMessage): Promise<string | null> {
+function toDataUrl(bytes: Uint8Array, path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "jpg";
+  const mime =
+    ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : ext === "gif" ? "image/gif" : "image/jpeg";
+  return `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`;
+}
+
+/** Builds the user message; images become vision content so the router picks qwen3-vl-flash. */
+async function buildUserMessage(message: TelegramMessage): Promise<QwenMessage | null> {
   const caption = (message.text ?? message.caption ?? "").trim();
+
+  const photo = message.photo?.length ? message.photo[message.photo.length - 1] : undefined;
+  const imageDocument =
+    message.document && (message.document.mime_type ?? "").startsWith("image/")
+      ? message.document
+      : undefined;
+  const imageFile = photo ?? imageDocument;
+
+  if (imageFile) {
+    if ((imageFile.file_size ?? 0) > MAX_IMAGE_BYTES) return null;
+    const { bytes, path } = await downloadFile(imageFile.file_id);
+    return {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text:
+            caption ||
+            "Baca isi gambar ini lalu analisa dari sudut pandang reverse engineering.",
+        },
+        { type: "image_url", image_url: { url: toDataUrl(bytes, path) } },
+      ],
+    };
+  }
 
   if (message.document) {
     const { file_id, file_name, file_size } = message.document;
-    if ((file_size ?? 0) > MAX_FILE_BYTES) {
-      return null;
-    }
+    if ((file_size ?? 0) > MAX_FILE_BYTES) return null;
     const { bytes } = await downloadFile(file_id);
     const described = describeFile(file_name ?? "upload.bin", bytes);
-    return [
-      caption || "Analisa file ini dari sudut pandang reverse engineering.",
-      "",
-      described,
-    ].join("\n");
+    return {
+      role: "user",
+      content: [
+        caption || "Analisa file ini dari sudut pandang reverse engineering.",
+        "",
+        described,
+      ].join("\n"),
+    };
   }
 
-  if (message.photo?.length) {
-    return caption
-      ? `${caption}\n\n(Catatan: gambar belum didukung — kirim teks/kode/hex atau file.)`
-      : null;
-  }
-
-  return caption || null;
+  return caption ? { role: "user", content: caption } : null;
 }
 
 export const Route = createFileRoute("/api/public/telegram/webhook")({
@@ -91,20 +125,20 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
 
         try {
           await sendChatAction(chatId);
-          const prompt = await buildPrompt(message);
-          if (!prompt) {
+          const userMessage = await buildUserMessage(message);
+          if (!userMessage) {
             await sendMessage(
               chatId,
-              "Kirim teks, kode, hex dump, atau file (maks 5 MB) yang mau dianalisa.",
+              "Kirim teks, kode, hex dump, gambar, atau file (maks 5 MB) yang mau dianalisa.",
             );
             return Response.json({ ok: true });
           }
 
-          const answer = await qwenChat([
+          const { text } = await qwenChat([
             { role: "system", content: RE_SYSTEM_PROMPT },
-            { role: "user", content: prompt },
+            userMessage,
           ]);
-          await sendMessage(chatId, answer);
+          await sendMessage(chatId, text);
         } catch (error) {
           console.error("CodeCracks webhook error", error);
           const detail = error instanceof Error ? error.message : String(error);
