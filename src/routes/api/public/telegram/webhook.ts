@@ -25,7 +25,13 @@ import {
   startRun,
   updateRun,
 } from "@/lib/memory.server";
-import { AgentStopped, qwenAgent, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
+import {
+  AgentStopped,
+  classifyIntent,
+  qwenAgent,
+  RE_SYSTEM_PROMPT,
+  type QwenMessage,
+} from "@/lib/qwen.server";
 import { executeToolCall, SANDBOX_TOOLS } from "@/lib/tools.server";
 import {
   deriveTelegramWebhookSecret,
@@ -438,14 +444,20 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
             await updateRun(chatId, { detail: current.slice(0, 180), steps: lines.length });
           };
 
-          await render("🔄 Mulai mengerjakan…");
+          // Plain chat answers straight from the model; only real work touches
+          // the sandbox, so greetings and small talk stay instant.
+          const hasNewUpload = Boolean(message.document || message.photo);
+          const intent = classifyIntent(conversation, { hasNewUpload });
+
+          await render(intent === "chat" ? "💬 Menjawab…" : "🔄 Mulai mengerjakan…");
 
           const { text } = await qwenAgent({
             messages: conversation,
-            tools: e2bEnabled() ? SANDBOX_TOOLS : [],
+            intent,
+            tools: intent === "exec" && e2bEnabled() ? SANDBOX_TOOLS : [],
             shouldStop: () => consumeStop(chatId),
-            // A file in the sandbox means the answer must come from running it.
-            forceFirstTool: uploads.length > 0,
+            // A freshly uploaded file means the answer must come from running it.
+            forceFirstTool: hasNewUpload,
             runTool: (call) => executeToolCall(chatId, call),
             onThinking: async (step) => {
               await sendChatAction(chatId);
