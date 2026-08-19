@@ -135,3 +135,24 @@ export async function uploadBytes(
   await sandbox.files.write(path, buffer);
   return path;
 }
+
+/**
+ * Files the user uploaded earlier, read straight from the live sandbox so a
+ * later message ("decrypt file yang tadi") still knows the real path.
+ * Returns nothing when no sandbox is alive — it never creates one.
+ */
+export async function listUploads(chatId: number): Promise<string[]> {
+  if (!e2bEnabled()) return [];
+  const existing = await getSandboxId(chatId);
+  if (!existing) return [];
+  try {
+    const sandbox = await Sandbox.connect(existing, { apiKey: apiKey() });
+    const entries = await sandbox.files.list("/home/user/uploads");
+    return entries
+      .filter((entry) => entry.type !== "dir")
+      .map((entry) => entry.path ?? `/home/user/uploads/${entry.name}`)
+      .slice(-5);
+  } catch {
+    return [];
+  }
+}
