@@ -1,5 +1,15 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { describeFile } from "@/lib/binary-preview";
+import {
+  e2bEnabled,
+  extractCode,
+  formatResult,
+  getSandbox,
+  resetSandbox,
+  runCode,
+  runCommand,
+} from "@/lib/e2b.server";
+import { clearHistory, loadHistory, memoryEnabled, saveMessages } from "@/lib/memory.server";
 import { qwenChat, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
 import {
   deriveTelegramWebhookSecret,
@@ -16,12 +26,24 @@ Model dipilih otomatis, kamu tidak perlu memilih:
 - coding / analisa kode & binary: qwen3-coder-plus
 - gambar / screenshot: qwen3-vl-flash
 
+Bot ini ingat percakapan sebelumnya dan punya sandbox Linux sendiri.
+
 Kirim pertanyaan RE apa saja, atau kirim file/gambar/kode untuk dianalisa:
 - snippet kode, disasm, hex dump, log debugger
 - screenshot IDA/Ghidra/x64dbg atau UI aplikasi
 - file .txt .c .py .js .asm .bin .exe .elf .dex .apk (maks ~5 MB)
 
-Perintah: /start, /help`;
+Sandbox & eksekusi:
+- /run <kode>  jalankan Python (atau kirim blok kode dengan tag js)
+- /sh <perintah>  jalankan perintah shell
+- /pip <paket>  install paket Python
+- /npm <paket>  install paket Node
+- /sandbox  info sandbox, /sandbox reset untuk hapus sandbox
+
+Memori:
+- /reset  hapus riwayat percakapan
+
+Perintah lain: /start, /help`;
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -93,6 +115,84 @@ async function buildUserMessage(message: TelegramMessage): Promise<QwenMessage |
   return caption ? { role: "user", content: caption } : null;
 }
 
+/** Plain-text version of a message, used for the stored conversation history. */
+function historyText(message: TelegramMessage, fallback: string): string {
+  const caption = (message.text ?? message.caption ?? "").trim();
+  if (message.photo?.length) return caption ? `[gambar] ${caption}` : "[gambar]";
+  if (message.document) {
+    const name = message.document.file_name ?? "file";
+    return caption ? `[file ${name}] ${caption}` : `[file ${name}]`;
+  }
+  return caption || fallback;
+}
+
+type CommandHandled = { handled: true } | { handled: false };
+
+async function handleSandboxCommand(
+  chatId: number,
+  command: string,
+  argument: string,
+): Promise<CommandHandled> {
+  const sandboxCommands = ["/run", "/sh", "/bash", "/pip", "/npm", "/sandbox"];
+  if (!sandboxCommands.includes(command)) return { handled: false };
+
+  if (!e2bEnabled()) {
+    await sendMessage(chatId, "Sandbox belum aktif: E2B_API_KEY belum diset di server.");
+    return { handled: true };
+  }
+
+  await sendChatAction(chatId);
+
+  if (command === "/sandbox") {
+    if (argument.toLowerCase() === "reset") {
+      await resetSandbox(chatId);
+      await sendMessage(chatId, "Sandbox dihapus. Sandbox baru dibuat saat perintah berikutnya.");
+      return { handled: true };
+    }
+    const sandbox = await getSandbox(chatId);
+    const info = await runCommand(chatId, "uname -a; python3 --version; node --version 2>/dev/null");
+    await sendMessage(
+      chatId,
+      `Sandbox aktif: \`${sandbox.sandboxId}\`\n\n` + formatResult(info, "Info"),
+    );
+    return { handled: true };
+  }
+
+  if (command === "/pip" || command === "/npm") {
+    if (!argument) {
+      await sendMessage(chatId, `Contoh: \`${command} requests\``);
+      return { handled: true };
+    }
+    const install =
+      command === "/pip"
+        ? `pip install --quiet ${argument}`
+        : `npm install --no-fund --no-audit ${argument}`;
+    const result = await runCommand(chatId, install);
+    await sendMessage(chatId, formatResult(result, `Install: ${argument}`));
+    return { handled: true };
+  }
+
+  if (command === "/sh" || command === "/bash") {
+    if (!argument) {
+      await sendMessage(chatId, "Contoh: `/sh ls -la`");
+      return { handled: true };
+    }
+    const result = await runCommand(chatId, argument);
+    await sendMessage(chatId, formatResult(result, "Shell"));
+    return { handled: true };
+  }
+
+  // /run
+  if (!argument) {
+    await sendMessage(chatId, "Contoh:\n`/run print(2 ** 32)`\natau kirim blok kode setelah /run.");
+    return { handled: true };
+  }
+  const { code, language } = extractCode(argument);
+  const result = await runCode(chatId, code, language);
+  await sendMessage(chatId, formatResult(result, `Run (${language})`));
+  return { handled: true };
+}
+
 export const Route = createFileRoute("/api/public/telegram/webhook")({
   server: {
     handlers: {
@@ -117,13 +217,30 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           return Response.json({ ok: true, ignored: true });
         }
 
-        const command = (message.text ?? "").trim().toLowerCase();
+        const raw = (message.text ?? "").trim();
+        const command = raw.split(/\s+/)[0]?.toLowerCase().split("@")[0] ?? "";
+        const argument = raw.slice(command.length).trim();
+
         if (command === "/start" || command === "/help") {
           await sendMessage(chatId, WELCOME);
           return Response.json({ ok: true });
         }
 
+        if (command === "/reset") {
+          await clearHistory(chatId);
+          await sendMessage(
+            chatId,
+            memoryEnabled()
+              ? "Riwayat percakapan dihapus. Mulai dari awal lagi."
+              : "Memori belum aktif: Supabase belum dikonfigurasi di server.",
+          );
+          return Response.json({ ok: true });
+        }
+
         try {
+          const sandboxResult = await handleSandboxCommand(chatId, command, argument);
+          if (sandboxResult.handled) return Response.json({ ok: true });
+
           await sendChatAction(chatId);
           const userMessage = await buildUserMessage(message);
           if (!userMessage) {
@@ -134,11 +251,17 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
             return Response.json({ ok: true });
           }
 
+          const history = await loadHistory(chatId);
           const { text } = await qwenChat([
             { role: "system", content: RE_SYSTEM_PROMPT },
+            ...history.map((m) => ({ role: m.role, content: m.content }) as QwenMessage),
             userMessage,
           ]);
           await sendMessage(chatId, text);
+          await saveMessages(chatId, [
+            { role: "user", content: historyText(message, "(tanpa teks)") },
+            { role: "assistant", content: text },
+          ]);
         } catch (error) {
           console.error("CodeCracks webhook error", error);
           const detail = error instanceof Error ? error.message : String(error);
