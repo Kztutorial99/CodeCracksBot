@@ -95,3 +95,48 @@ export async function setSandboxId(chatId: number, sandboxId: string | null) {
     console.error("setSandboxId failed", error);
   }
 }
+
+/**
+ * Cancellation flag for a running agent turn. The webhook runs serverless, so a
+ * /stop from another request can only be seen through shared storage.
+ */
+export async function requestStop(chatId: number): Promise<boolean> {
+  if (!memoryEnabled()) return false;
+  try {
+    const { error } = await client()
+      .from("chat_stop")
+      .upsert({ chat_id: chatId, requested_at: new Date().toISOString() }, { onConflict: "chat_id" });
+    if (error) throw error;
+    return true;
+  } catch (error) {
+    console.error("requestStop failed", error);
+    return false;
+  }
+}
+
+export async function clearStop(chatId: number) {
+  if (!memoryEnabled()) return;
+  try {
+    await client().from("chat_stop").delete().eq("chat_id", chatId);
+  } catch (error) {
+    console.error("clearStop failed", error);
+  }
+}
+
+/** True when a /stop arrived; the flag is consumed so the next run starts clean. */
+export async function consumeStop(chatId: number): Promise<boolean> {
+  if (!memoryEnabled()) return false;
+  try {
+    const { data } = await client()
+      .from("chat_stop")
+      .select("chat_id")
+      .eq("chat_id", chatId)
+      .maybeSingle();
+    if (!data) return false;
+    await clearStop(chatId);
+    return true;
+  } catch (error) {
+    console.error("consumeStop failed", error);
+    return false;
+  }
+}
