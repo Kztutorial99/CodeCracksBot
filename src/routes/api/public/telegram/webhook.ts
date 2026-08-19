@@ -5,6 +5,7 @@ import {
   extractCode,
   formatResult,
   getSandbox,
+  listUploads,
   resetSandbox,
   runCode,
   runCommand,
@@ -369,6 +370,18 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           return Response.json({ ok: true });
         }
 
+        // Telegram redelivers an update when the webhook answers slowly. Without
+        // this guard the same message starts a second agent run and the chat
+        // gets duplicate replies.
+        const active = await getRun(chatId);
+        if (
+          active !== "unavailable" &&
+          active?.status === "running" &&
+          Date.now() - new Date(active.updatedAt).getTime() < RUN_STALE_MS
+        ) {
+          return Response.json({ ok: true, busy: true });
+        }
+
         let statusId: number | null = null;
         try {
           const sandboxResult = await handleSandboxCommand(chatId, command, argument);
@@ -387,8 +400,24 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           await clearStop(chatId);
           await startRun(chatId, "menyiapkan analisa");
           const history = await loadHistory(chatId);
+          // Earlier uploads still live in the sandbox; telling the model their
+          // real paths stops it from inventing a filename on follow-up turns.
+          const uploads = await listUploads(chatId);
+          const filesNote: QwenMessage[] = uploads.length
+            ? [
+                {
+                  role: "system",
+                  content: [
+                    "File yang sudah diupload user dan masih ada di sandbox:",
+                    ...uploads.map((path) => `- ${path}`),
+                    "Pakai path itu apa adanya lewat tool, jangan menebak nama file.",
+                  ].join("\n"),
+                },
+              ]
+            : [];
           const conversation: QwenMessage[] = [
             { role: "system", content: RE_SYSTEM_PROMPT },
+            ...filesNote,
             ...history.map((m) => ({ role: m.role, content: m.content }) as QwenMessage),
             userMessage,
           ];
