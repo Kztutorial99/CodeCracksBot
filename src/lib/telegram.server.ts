@@ -154,3 +154,26 @@ export async function deleteStatus(chatId: number, messageId: number | null) {
     // best-effort
   }
 }
+
+/** Pins the progress message so the running status stays visible at the top. */
+export async function pinMessage(chatId: number, messageId: number | null) {
+  if (messageId == null) return;
+  try {
+    await callTelegram("pinChatMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+      disable_notification: true,
+    });
+  } catch {
+    // pinning needs admin rights in groups; best-effort
+  }
+}
+
+export async function unpinMessage(chatId: number, messageId: number | null) {
+  if (messageId == null) return;
+  try {
+    await callTelegram("unpinChatMessage", { chat_id: chatId, message_id: messageId });
+  } catch {
+    // best-effort
+  }
+}

@@ -32,3 +32,17 @@ grant all on public.chat_stop to service_role;
 alter table public.chat_messages enable row level security;
 alter table public.chat_sandbox enable row level security;
 alter table public.chat_stop enable row level security;
+
+-- Live run state for /status and the pinned progress message.
+create table if not exists public.chat_run (
+  chat_id bigint primary key,
+  status text not null check (status in ('running', 'idle')),
+  detail text,
+  steps int not null default 0,
+  message_id bigint,
+  started_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+grant all on public.chat_run to service_role;
+alter table public.chat_run enable row level security;

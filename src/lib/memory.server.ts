@@ -140,3 +140,96 @@ export async function consumeStop(chatId: number): Promise<boolean> {
     return false;
   }
 }
+
+export type RunState = {
+  status: "running" | "idle";
+  detail: string | null;
+  steps: number;
+  messageId: number | null;
+  startedAt: string;
+  updatedAt: string;
+};
+
+/** A run that stopped updating is treated as dead (serverless can die mid-turn). */
+export const RUN_STALE_MS = 3 * 60 * 1000;
+
+export async function startRun(chatId: number, detail: string): Promise<void> {
+  if (!memoryEnabled()) return;
+  try {
+    const now = new Date().toISOString();
+    await client()
+      .from("chat_run")
+      .upsert(
+        { chat_id: chatId, status: "running", detail, steps: 0, message_id: null, started_at: now, updated_at: now },
+        { onConflict: "chat_id" },
+      );
+  } catch (error) {
+    console.error("startRun failed", error);
+  }
+}
+
+export async function updateRun(
+  chatId: number,
+  patch: { detail?: string; steps?: number; messageId?: number | null },
+): Promise<void> {
+  if (!memoryEnabled()) return;
+  try {
+    const row: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (patch.detail !== undefined) row["detail"] = patch.detail;
+    if (patch.steps !== undefined) row["steps"] = patch.steps;
+    if (patch.messageId !== undefined) row["message_id"] = patch.messageId;
+    await client().from("chat_run").update(row).eq("chat_id", chatId);
+  } catch (error) {
+    console.error("updateRun failed", error);
+  }
+}
+
+export async function finishRun(chatId: number, detail: string): Promise<void> {
+  if (!memoryEnabled()) return;
+  try {
+    await client()
+      .from("chat_run")
+      .upsert(
+        { chat_id: chatId, status: "idle", detail, message_id: null, updated_at: new Date().toISOString() },
+        { onConflict: "chat_id" },
+      );
+  } catch (error) {
+    console.error("finishRun failed", error);
+  }
+}
+
+/** "unavailable" means the chat_run table is missing (schema not applied yet). */
+export async function getRun(chatId: number): Promise<RunState | null | "unavailable"> {
+  if (!memoryEnabled()) return null;
+  try {
+    const { data, error } = await client()
+      .from("chat_run")
+      .select("status, detail, steps, message_id, started_at, updated_at")
+      .eq("chat_id", chatId)
+      .maybeSingle();
+    if (error) {
+      if (error.code === "42P01") return "unavailable";
+      throw error;
+    }
+    if (!data) return null;
+    const row = data as {
+      status: "running" | "idle";
+      detail: string | null;
+      steps: number | null;
+      message_id: number | null;
+      started_at: string;
+      updated_at: string;
+    };
+    return {
+      status: row.status,
+      detail: row.detail,
+      steps: row.steps ?? 0,
+      messageId: row.message_id,
+      startedAt: row.started_at,
+      updatedAt: row.updated_at,
+    };
+  } catch (error) {
+    console.error("getRun failed", error);
+    return null;
+  }
+}

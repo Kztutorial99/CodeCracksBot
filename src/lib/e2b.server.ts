@@ -120,3 +120,18 @@ export function extractCode(input: string): { code: string; language: "python" |
   }
   return { code: input, language: "python" };
 }
+
+/** Uploads raw bytes into the sandbox so the model can run tools on the real file. */
+export async function uploadBytes(
+  chatId: number,
+  name: string,
+  bytes: Uint8Array,
+): Promise<string> {
+  const safe = (name || "upload.bin").replace(/[^\w.\-]+/g, "_").slice(-80);
+  const path = `/home/user/uploads/${safe}`;
+  const sandbox = await getSandbox(chatId);
+  await sandbox.files.makeDir("/home/user/uploads").catch(() => undefined);
+  const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  await sandbox.files.write(path, buffer);
+  return path;
+}

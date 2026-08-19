@@ -8,15 +8,21 @@ import {
   resetSandbox,
   runCode,
   runCommand,
+  uploadBytes,
 } from "@/lib/e2b.server";
 import {
   clearHistory,
   clearStop,
   consumeStop,
+  finishRun,
+  getRun,
   loadHistory,
   memoryEnabled,
   requestStop,
+  RUN_STALE_MS,
   saveMessages,
+  startRun,
+  updateRun,
 } from "@/lib/memory.server";
 import { AgentStopped, qwenAgent, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
 import { executeToolCall, SANDBOX_TOOLS } from "@/lib/tools.server";
@@ -26,9 +32,11 @@ import {
   safeEqual,
   deleteStatus,
   editStatus,
+  pinMessage,
   sendChatAction,
   sendMessage,
   sendStatus,
+  unpinMessage,
 } from "@/lib/telegram.server";
 
 const WELCOME = `CodeCracks — asisten Reverse Engineering (Qwen AI)
@@ -53,7 +61,8 @@ Contoh: "hitung CRC32 string ini", "unpack APK ini dan lihat manifestnya",
 "kenapa script ini error?" — AI langsung eksekusi sendiri di sandbox.
 
 Opsional (manual): /run /sh /pip /npm /sandbox
-/stop hentikan proses yang sedang jalan · /reset hapus memori · /help`;
+/status lihat bot idle atau sedang jalan · /stop hentikan proses
+/reset hapus memori · /help`;
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -80,7 +89,10 @@ function toDataUrl(bytes: Uint8Array, path: string): string {
 }
 
 /** Builds the user message; images become vision content so the router picks qwen3-vl-flash. */
-async function buildUserMessage(message: TelegramMessage): Promise<QwenMessage | null> {
+async function buildUserMessage(
+  chatId: number,
+  message: TelegramMessage,
+): Promise<QwenMessage | null> {
   const caption = (message.text ?? message.caption ?? "").trim();
 
   const photo = message.photo?.length ? message.photo[message.photo.length - 1] : undefined;
@@ -111,11 +123,31 @@ async function buildUserMessage(message: TelegramMessage): Promise<QwenMessage |
     const { file_id, file_name, file_size } = message.document;
     if ((file_size ?? 0) > MAX_FILE_BYTES) return null;
     const { bytes } = await downloadFile(file_id);
-    const described = describeFile(file_name ?? "upload.bin", bytes);
+    const name = file_name ?? "upload.bin";
+    const described = describeFile(name, bytes);
+
+    // The real file is copied into the sandbox so the model can actually run
+    // tools on it instead of guessing from a truncated preview.
+    let sandboxNote = "";
+    if (e2bEnabled()) {
+      try {
+        const path = await uploadBytes(chatId, name, bytes);
+        sandboxNote = [
+          "",
+          `File aslinya sudah tersedia di sandbox: \`${path}\` (${bytes.length} bytes).`,
+          "WAJIB kerjakan file itu dengan tool (run_shell/run_python) — jangan menebak dari",
+          "potongan preview di bawah, dan jangan minta user menjalankan perintah apa pun.",
+        ].join("\n");
+      } catch (error) {
+        console.error("Sandbox upload failed", error);
+      }
+    }
+
     return {
       role: "user",
       content: [
         caption || "Analisa file ini dari sudut pandang reverse engineering.",
+        sandboxNote,
         "",
         described,
       ].join("\n"),
@@ -255,6 +287,59 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           return Response.json({ ok: true });
         }
 
+        if (command === "/status") {
+          if (!memoryEnabled()) {
+            await sendMessage(
+              chatId,
+              "Status butuh memori aktif: Supabase belum dikonfigurasi di server.",
+            );
+            return Response.json({ ok: true });
+          }
+          const state = await getRun(chatId);
+          if (state === "unavailable") {
+            await sendMessage(
+              chatId,
+              "Tabel `chat_run` belum ada. Jalankan `supabase/schema.sql` di SQL editor Supabase dulu.",
+            );
+            return Response.json({ ok: true });
+          }
+          const run = state;
+          const fresh =
+            run?.status === "running" &&
+            Date.now() - new Date(run.updatedAt).getTime() < RUN_STALE_MS;
+          if (run && fresh) {
+            const seconds = Math.max(1, Math.round((Date.now() - new Date(run.startedAt).getTime()) / 1000));
+            await sendMessage(
+              chatId,
+              [
+                "🔄 Status: *sedang mengerjakan sesuatu*",
+                `Berjalan: ${seconds}s · langkah selesai: ${run.steps}`,
+                run.detail ? `Sekarang: ${run.detail}` : "",
+                "",
+                "Kirim /stop kalau mau dihentikan.",
+              ]
+                .filter(Boolean)
+                .join("\n"),
+            );
+            return Response.json({ ok: true });
+          }
+          await sendMessage(
+            chatId,
+            [
+              "✅ Status: *idle* — tidak ada proses yang berjalan.",
+              run?.status === "running"
+                ? "(proses terakhir berhenti tanpa selesai, sudah dianggap mati)"
+                : run?.detail
+                  ? `Terakhir: ${run.detail}`
+                  : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          );
+          if (run?.status === "running") await finishRun(chatId, "berhenti tanpa selesai");
+          return Response.json({ ok: true });
+        }
+
         if (command === "/stop") {
           if (!memoryEnabled()) {
             await sendMessage(
@@ -290,7 +375,7 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           if (sandboxResult.handled) return Response.json({ ok: true });
 
           await sendChatAction(chatId);
-          const userMessage = await buildUserMessage(message);
+          const userMessage = await buildUserMessage(chatId, message);
           if (!userMessage) {
             await sendMessage(
               chatId,
@@ -300,6 +385,7 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           }
 
           await clearStop(chatId);
+          await startRun(chatId, "menyiapkan analisa");
           const history = await loadHistory(chatId);
           const conversation: QwenMessage[] = [
             { role: "system", content: RE_SYSTEM_PROMPT },
@@ -309,11 +395,21 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
 
           // Live progress so long runs never look stuck.
           const lines: string[] = [];
+          // Shown immediately (and pinned) so a long turn is visible from the start.
           const render = async (current: string) => {
             const body = [...lines, current].filter(Boolean).join("\n");
-            if (statusId == null) statusId = await sendStatus(chatId, body);
-            else await editStatus(chatId, statusId, body);
+            if (statusId == null) {
+              statusId = await sendStatus(chatId, body);
+              // Pinned so the running status stays visible at the top of the chat.
+              await pinMessage(chatId, statusId);
+              await updateRun(chatId, { messageId: statusId });
+            } else {
+              await editStatus(chatId, statusId, body);
+            }
+            await updateRun(chatId, { detail: current.slice(0, 180), steps: lines.length });
           };
+
+          await render("🔄 Mulai mengerjakan…");
 
           const { text } = await qwenAgent({
             messages: conversation,
@@ -337,7 +433,9 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
               await render("🧠 Menganalisa hasil…");
             },
           });
+          await unpinMessage(chatId, statusId);
           await deleteStatus(chatId, statusId);
+          await finishRun(chatId, "selesai");
           await sendMessage(chatId, text);
           await saveMessages(chatId, [
             { role: "user", content: historyText(message, "(tanpa teks)") },
@@ -345,10 +443,12 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           ]);
         } catch (error) {
           try {
+            await unpinMessage(chatId, statusId);
             await deleteStatus(chatId, statusId);
           } catch {
             // status message already gone
           }
+          await finishRun(chatId, error instanceof AgentStopped ? "dihentikan" : "gagal");
           if (error instanceof AgentStopped) {
             const done = error.steps.length
               ? `\n\nLangkah yang sempat selesai:\n${error.steps
