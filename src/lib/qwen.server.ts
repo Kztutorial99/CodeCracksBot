@@ -110,6 +110,44 @@ export function lengthDirective(messages: QwenMessage[]): QwenMessage | null {
   };
 }
 
+/**
+ * Chat vs execution routing. Plain conversation must never spin up the sandbox;
+ * only real work (files, code, analysis, "run/decode/patch this") gets tools.
+ */
+const SMALLTALK_RE =
+  /^(hai|hi|halo|hello|hey|p|pagi|siang|sore|malam|assalam\w*|apa kabar|thanks?|makasih|terima kasih|ok(e|ay)?|sip|mantap|wkwk|haha|lol|bye|dadah|siapa kamu|kamu siapa|lu siapa|bisa apa|test(ing)?)\b[\s\S]{0,40}$/i;
+
+const EXEC_HINTS = [
+  /```/,
+  /\b(0x[0-9a-f]{4,})\b/i,
+  /\b(jalankan|eksekusi|run|execute|decode|decrypt|dekripsi|deobfuscate|unpack|extract|dump|disassemble|decompile|dekompilasi|patch|hook|bruteforce|crack|hitung|compute|convert|parse|analisa|analisis|analyze|scan|cek file|periksa file)\b/i,
+  /\b(install|pip|npm|apt|python|bash|shell|script)\b/i,
+  /\b(hash|md5|sha1|sha256|base64|xor|aes|rc4|crc32)\b/i,
+  /\.(c|cpp|h|py|js|ts|java|kt|go|rs|asm|s|dex|apk|exe|elf|so|dll|bin|smali|jar|zip|json|txt)\b/i,
+  /\b(function|def |class |import |#include|public static|=>|const |let |var )\b/,
+  /\b(mov |push |pop |call |jmp |lea |xor )\b/i,
+  /\b(buatkan|bikin|write a script|tulis script|refactor|fix this code|debug)\b/i,
+];
+
+export type QwenIntent = "chat" | "exec";
+
+/** Decides whether a turn is plain chat or needs the execution sandbox. */
+export function classifyIntent(
+  messages: QwenMessage[],
+  context?: { hasNewUpload?: boolean; hasImage?: boolean },
+): QwenIntent {
+  if (context?.hasNewUpload) return "exec";
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  if (!lastUser) return "chat";
+  if (hasImage(lastUser.content)) return "exec";
+  const text = textOf(lastUser.content).trim();
+  if (!text) return "chat";
+  if (SMALLTALK_RE.test(text)) return "chat";
+  if (EXEC_HINTS.some((re) => re.test(text))) return "exec";
+  // Long technical prompts usually mean real work; short questions stay chat.
+  return text.split(/\s+/).filter(Boolean).length > 40 ? "exec" : "chat";
+}
+
 export type QwenToolCall = {
   id?: string;
   type?: string;
@@ -138,17 +176,32 @@ async function callQwen(
   const apiKey = process.env["QWEN_API_KEY"] ?? process.env["DASHSCOPE_API_KEY"];
   if (!apiKey) throw new Error("QWEN_API_KEY is not configured");
 
-  const body: Record<string, unknown> = { model, messages, stream: false };
-  if (tools && tools.length > 0) {
-    body["tools"] = tools;
-    body["tool_choice"] = toolChoice;
-  }
+  const send = async (choice: "auto" | "required"): Promise<Response> => {
+    const body: Record<string, unknown> = { model, messages, stream: false };
+    if (tools && tools.length > 0) {
+      body["tools"] = tools;
+      body["tool_choice"] = choice;
+    }
+    return fetch(`${QWEN_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  };
 
-  const response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let response = await send(toolChoice);
+
+  // Qwen thinking-mode models reject tool_choice="required". That is a hard
+  // 400 on the request, so retry once with "auto" instead of failing the turn.
+  if (!response.ok && toolChoice === "required") {
+    const detail = await response.text();
+    if (/tool_choice/i.test(detail)) {
+      response = await send("auto");
+    } else {
+      console.error(`Qwen ${model} failed [${response.status}]: ${detail}`);
+      throw new Error(`Qwen request failed [${response.status}]: ${detail}`);
+    }
+  }
 
   if (!response.ok) {
     const detail = await response.text();
@@ -238,11 +291,14 @@ export async function qwenAgent(params: {
   shouldStop?: () => Promise<boolean> | boolean;
   /** Forces a tool call on the first step (used when the user uploaded a file). */
   forceFirstTool?: boolean;
+  /** "chat" disables the sandbox entirely for plain conversation turns. */
+  intent?: QwenIntent;
 }): Promise<{ text: string; model: string; task: QwenTask; steps: AgentStep[] }> {
   const chosen = pickModel(params.messages);
   // Every routed model (text, coding and vision) supports tool calling, so
   // screenshots can trigger sandbox work too.
-  const toolsEnabled = params.tools.length > 0;
+  const intent: QwenIntent = params.intent ?? "exec";
+  const toolsEnabled = intent === "exec" && params.tools.length > 0;
   const model = chosen.model;
 
   const brevity = lengthDirective(params.messages);
@@ -251,7 +307,7 @@ export async function qwenAgent(params: {
     : [...params.messages];
   const steps: AgentStep[] = [];
   let nudges = 0;
-  let forceTools = params.forceFirstTool === true;
+  let forceTools = toolsEnabled && params.forceFirstTool === true;
 
   const stopped = async () => (params.shouldStop ? await params.shouldStop() : false);
 
