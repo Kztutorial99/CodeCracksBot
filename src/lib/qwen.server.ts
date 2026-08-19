@@ -40,6 +40,12 @@ Sandbox tools (run_python, run_shell, install_package, write_file):
 - Chain tools: install -> write_file -> run_shell -> read output -> conclude. Keep going until you have
   a real answer, then explain it.
 - Base your final answer on actual tool output, not on assumptions. Show the relevant output briefly.
+- Never answer with "install X then run Y" as the deliverable. Installing and running is YOUR job:
+  call install_package, then write_file/run_shell/run_python, read the real output, and report what
+  actually happened (found strings, decompiled source, header fields, error messages).
+- If a tool fails, do not give up and do not hand the command to the user: try another package,
+  another tool, or another technique in the sandbox until you have a real result or a proven dead end.
+- When a file path is given to you (e.g. /home/user/uploads/...), always operate on that exact path.
 - Only skip the sandbox for pure conceptual/theory questions.`;
 
 export type QwenTextContent = { type: "text"; text: string };
@@ -179,6 +185,16 @@ export async function qwenChat(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+/** Answers that just hand shell commands to the user instead of running them. */
+const INSTRUCTION_HINTS = [
+  /\b(pip|pip3|apt|apt-get|npm|brew|luarocks)\s+install\b/i,
+  /\b(jalankan|coba jalankan|silakan jalankan|ketik|run this|try running|you can run|execute this)\b/i,
+];
+
+function looksLikeInstructions(text: string): boolean {
+  return INSTRUCTION_HINTS.some((re) => re.test(text));
+}
+
 /** Max model<->tool round trips before we force a final answer. */
 const MAX_STEPS = 8;
 
@@ -211,8 +227,9 @@ export async function qwenAgent(params: {
   shouldStop?: () => Promise<boolean> | boolean;
 }): Promise<{ text: string; model: string; task: QwenTask; steps: AgentStep[] }> {
   const chosen = pickModel(params.messages);
-  // Vision model handles images but not tools; tools resume on the text model afterwards.
-  const toolsEnabled = chosen.task !== "vision" && params.tools.length > 0;
+  // Every routed model (text, coding and vision) supports tool calling, so
+  // screenshots can trigger sandbox work too.
+  const toolsEnabled = params.tools.length > 0;
   const model = chosen.model;
 
   const brevity = lengthDirective(params.messages);
@@ -220,6 +237,7 @@ export async function qwenAgent(params: {
     ? [...params.messages, brevity]
     : [...params.messages];
   const steps: AgentStep[] = [];
+  let nudged = false;
 
   const stopped = async () => (params.shouldStop ? await params.shouldStop() : false);
 
@@ -239,6 +257,20 @@ export async function qwenAgent(params: {
     if (toolCalls.length === 0) {
       const text = (choice.content ?? "").trim();
       if (!text) throw new Error("Qwen returned an empty response");
+      // The model sometimes hands the user a list of commands instead of running
+      // them. One corrective nudge turns that back into real sandbox work.
+      if (useTools && steps.length === 0 && !nudged && looksLikeInstructions(text)) {
+        nudged = true;
+        conversation.push({ role: "assistant", content: text });
+        conversation.push({
+          role: "user",
+          content:
+            "Jangan menyuruh saya menjalankan perintah. Kamu punya sandbox Linux: jalankan sendiri " +
+            "sekarang (install_package lalu run_shell/run_python pada file yang disebutkan), lalu " +
+            "laporkan hasil nyatanya.",
+        });
+        continue;
+      }
       return { text, model, task: chosen.task, steps };
     }
 
