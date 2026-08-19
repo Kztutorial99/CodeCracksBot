@@ -24,7 +24,19 @@ Rules:
 - If input is a binary/hex/asm dump, identify format, notable strings, likely purpose, and next analysis steps.
 - If input is an image (screenshot of code, disassembly, debugger, or app UI), read the visible text first, then analyse it.
 - Refuse only clearly illegal requests (malware distribution, real-world piracy keys, attacking systems the user does not own); offer a defensive/educational alternative instead.
-- Reply in the language the user writes in (Indonesian or English).`;
+- Reply in the language the user writes in (Indonesian or English).
+
+Sandbox tools (run_python, run_shell, install_package, write_file):
+- You have a persistent Linux sandbox. USE IT PROACTIVELY and silently whenever executing something
+  gives a more reliable answer than guessing: decoding/deobfuscating, computing hashes or checksums,
+  parsing PE/ELF/DEX headers, unpacking archives, disassembling, testing a script, verifying a patch.
+- The user must NEVER be asked to type a command. Never tell them to run /sh, /pip or /run, and never
+  say "you can run this yourself" — just call the tool and report the real result.
+- Install what you need (install_package) instead of saying a library is missing.
+- Chain tools: install -> write_file -> run_shell -> read output -> conclude. Keep going until you have
+  a real answer, then explain it.
+- Base your final answer on actual tool output, not on assumptions. Show the relevant output briefly.
+- Only skip the sandbox for pure conceptual/theory questions.`;
 
 export type QwenTextContent = { type: "text"; text: string };
 export type QwenImageContent = { type: "image_url"; image_url: { url: string } };
@@ -65,43 +77,73 @@ export function pickModel(messages: QwenMessage[]): { model: string; task: QwenT
   return { model: MODELS.text, task: "text" };
 }
 
+export type QwenToolCall = {
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+};
+
+export type QwenAssistantMessage = {
+  role: "assistant";
+  content?: string | null;
+  tool_calls?: QwenToolCall[];
+};
+
+export type QwenAnyMessage =
+  | QwenMessage
+  | QwenAssistantMessage
+  | { role: "tool"; tool_call_id: string; name?: string; content: string };
+
+type QwenChoiceMessage = { content?: string | null; tool_calls?: QwenToolCall[] };
+
+async function callQwen(
+  model: string,
+  messages: QwenAnyMessage[],
+  tools?: readonly unknown[],
+): Promise<QwenChoiceMessage> {
+  const apiKey = process.env["QWEN_API_KEY"] ?? process.env["DASHSCOPE_API_KEY"];
+  if (!apiKey) throw new Error("QWEN_API_KEY is not configured");
+
+  const body: Record<string, unknown> = { model, messages, stream: false };
+  if (tools && tools.length > 0) {
+    body["tools"] = tools;
+    body["tool_choice"] = "auto";
+  }
+
+  const response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    console.error(`Qwen ${model} failed [${response.status}]: ${detail}`);
+    throw new Error(`Qwen request failed [${response.status}]: ${detail}`);
+  }
+
+  const data = (await response.json()) as { choices?: { message?: QwenChoiceMessage }[] };
+  const choice = data.choices?.[0]?.message;
+  if (!choice) throw new Error("Qwen returned an empty response");
+  return choice;
+}
+
 export async function qwenChat(
   messages: QwenMessage[],
   options?: { task?: QwenTask },
 ): Promise<{ text: string; model: string; task: QwenTask }> {
-  const apiKey = process.env["QWEN_API_KEY"] ?? process.env["DASHSCOPE_API_KEY"];
-  if (!apiKey) throw new Error("QWEN_API_KEY is not configured");
-
   const chosen = options?.task
     ? { model: MODELS[options.task], task: options.task }
     : pickModel(messages);
 
   const attempts: { model: string; task: QwenTask }[] = [chosen];
-  // Fallback chain so a single unavailable model never breaks the bot.
   if (chosen.task !== "text") attempts.push({ model: MODELS.text, task: "text" });
 
   let lastError: unknown;
   for (const attempt of attempts) {
     try {
-      const response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ model: attempt.model, messages, stream: false }),
-      });
-
-      if (!response.ok) {
-        const body = await response.text();
-        console.error(`Qwen ${attempt.model} failed [${response.status}]: ${body}`);
-        throw new Error(`Qwen request failed [${response.status}]: ${body}`);
-      }
-
-      const data = (await response.json()) as {
-        choices?: { message?: { content?: string } }[];
-      };
-      const text = data.choices?.[0]?.message?.content?.trim();
+      const choice = await callQwen(attempt.model, messages);
+      const text = (choice.content ?? "").trim();
       if (!text) throw new Error("Qwen returned an empty response");
       return { text, model: attempt.model, task: attempt.task };
     } catch (error) {
@@ -109,4 +151,67 @@ export async function qwenChat(
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** Max model<->tool round trips before we force a final answer. */
+const MAX_STEPS = 8;
+
+export type AgentStep = { name: string; summary: string };
+
+/**
+ * Agentic loop: the model decides on its own when to use the sandbox.
+ * `runTool` executes one tool call and returns the text handed back to the model.
+ */
+export async function qwenAgent(params: {
+  messages: QwenMessage[];
+  tools: readonly unknown[];
+  runTool: (call: QwenToolCall) => Promise<{ id: string; name: string; summary: string; output: string }>;
+  onStep?: (step: AgentStep) => Promise<void> | void;
+}): Promise<{ text: string; model: string; task: QwenTask; steps: AgentStep[] }> {
+  const chosen = pickModel(params.messages);
+  // Vision model handles images but not tools; tools resume on the text model afterwards.
+  const toolsEnabled = chosen.task !== "vision" && params.tools.length > 0;
+  const model = chosen.model;
+
+  const conversation: QwenAnyMessage[] = [...params.messages];
+  const steps: AgentStep[] = [];
+
+  for (let step = 0; step < MAX_STEPS; step += 1) {
+    const useTools = toolsEnabled && step < MAX_STEPS - 1;
+    let choice: QwenChoiceMessage;
+    try {
+      choice = await callQwen(model, conversation, useTools ? params.tools : undefined);
+    } catch (error) {
+      if (model === MODELS.text) throw error;
+      choice = await callQwen(MODELS.text, conversation, useTools ? params.tools : undefined);
+    }
+
+    const toolCalls = choice.tool_calls ?? [];
+    if (toolCalls.length === 0) {
+      const text = (choice.content ?? "").trim();
+      if (!text) throw new Error("Qwen returned an empty response");
+      return { text, model, task: chosen.task, steps };
+    }
+
+    conversation.push({ role: "assistant", content: choice.content ?? "", tool_calls: toolCalls });
+
+    for (const call of toolCalls) {
+      const result = await params.runTool(call);
+      steps.push({ name: result.name, summary: result.summary });
+      if (params.onStep) await params.onStep({ name: result.name, summary: result.summary });
+      conversation.push({
+        role: "tool",
+        tool_call_id: result.id,
+        name: result.name,
+        content: result.output,
+      });
+    }
+  }
+
+  const final = await callQwen(model, [
+    ...conversation,
+    { role: "user", content: "Berhenti memakai tool. Berikan kesimpulan akhir dari hasil di atas sekarang." },
+  ]);
+  const text = (final.content ?? "").trim() || "Tidak ada jawaban akhir dari model.";
+  return { text, model, task: chosen.task, steps };
 }

@@ -10,7 +10,8 @@ import {
   runCommand,
 } from "@/lib/e2b.server";
 import { clearHistory, loadHistory, memoryEnabled, saveMessages } from "@/lib/memory.server";
-import { qwenChat, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
+import { qwenAgent, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
+import { executeToolCall, SANDBOX_TOOLS } from "@/lib/tools.server";
 import {
   deriveTelegramWebhookSecret,
   downloadFile,
@@ -21,29 +22,26 @@ import {
 
 const WELCOME = `CodeCracks — asisten Reverse Engineering (Qwen AI)
 
-Model dipilih otomatis, kamu tidak perlu memilih:
-- teks kualitas terbaik: qwen3.8-max
-- coding / analisa kode & binary: qwen3-coder-plus
-- gambar / screenshot: qwen3-vl-flash
+Ngobrol biasa saja. Tidak perlu perintah apa pun.
 
-Bot ini ingat percakapan sebelumnya dan punya sandbox Linux sendiri.
+AI-nya punya sandbox Linux sendiri dan akan memakainya otomatis kalau memang
+perlu — menjalankan kode, install paket, decode/unpack, cek header binary,
+disassemble, uji script — lalu menjawab dari hasil yang benar-benar dijalankan.
 
-Kirim pertanyaan RE apa saja, atau kirim file/gambar/kode untuk dianalisa:
-- snippet kode, disasm, hex dump, log debugger
+Model juga dipilih otomatis:
+- teks: qwen3.8-max
+- kode & binary: qwen3-coder-plus
+- gambar/screenshot: qwen3-vl-flash
+
+Kirim apa saja untuk dianalisa:
+- pertanyaan RE, snippet kode, disasm, hex dump, log debugger
 - screenshot IDA/Ghidra/x64dbg atau UI aplikasi
 - file .txt .c .py .js .asm .bin .exe .elf .dex .apk (maks ~5 MB)
 
-Sandbox & eksekusi:
-- /run <kode>  jalankan Python (atau kirim blok kode dengan tag js)
-- /sh <perintah>  jalankan perintah shell
-- /pip <paket>  install paket Python
-- /npm <paket>  install paket Node
-- /sandbox  info sandbox, /sandbox reset untuk hapus sandbox
+Contoh: "hitung CRC32 string ini", "unpack APK ini dan lihat manifestnya",
+"kenapa script ini error?" — AI langsung eksekusi sendiri di sandbox.
 
-Memori:
-- /reset  hapus riwayat percakapan
-
-Perintah lain: /start, /help`;
+Opsional (manual): /run /sh /pip /npm /sandbox · /reset hapus memori · /help`;
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -252,11 +250,22 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           }
 
           const history = await loadHistory(chatId);
-          const { text } = await qwenChat([
+          const conversation: QwenMessage[] = [
             { role: "system", content: RE_SYSTEM_PROMPT },
             ...history.map((m) => ({ role: m.role, content: m.content }) as QwenMessage),
             userMessage,
-          ]);
+          ];
+
+          // The model decides by itself whether to touch the sandbox.
+          const { text } = await qwenAgent({
+            messages: conversation,
+            tools: e2bEnabled() ? SANDBOX_TOOLS : [],
+            runTool: (call) => executeToolCall(chatId, call),
+            onStep: async () => {
+              // Keep the "typing…" indicator alive across long tool runs.
+              await sendChatAction(chatId);
+            },
+          });
           await sendMessage(chatId, text);
           await saveMessages(chatId, [
             { role: "user", content: historyText(message, "(tanpa teks)") },
