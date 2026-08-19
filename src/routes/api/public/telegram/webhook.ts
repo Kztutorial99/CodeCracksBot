@@ -263,10 +263,12 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
             );
             return Response.json({ ok: true });
           }
-          await requestStop(chatId);
+          const ok = await requestStop(chatId);
           await sendMessage(
             chatId,
-            "⏹️ Stop diminta. Proses berhenti setelah langkah yang sedang jalan selesai.",
+            ok
+              ? "⏹️ Stop diminta. Proses berhenti setelah langkah yang sedang jalan selesai."
+              : "Gagal menyimpan permintaan stop. Jalankan tabel `chat_stop` dari supabase/schema.sql dulu.",
           );
           return Response.json({ ok: true });
         }
