@@ -184,6 +184,16 @@ const MAX_STEPS = 8;
 
 export type AgentStep = { name: string; summary: string };
 
+/** Thrown when the user asked the agent to stop mid-run (/stop). */
+export class AgentStopped extends Error {
+  readonly steps: AgentStep[];
+  constructor(steps: AgentStep[]) {
+    super("Agent stopped by user");
+    this.name = "AgentStopped";
+    this.steps = steps;
+  }
+}
+
 /**
  * Agentic loop: the model decides on its own when to use the sandbox.
  * `runTool` executes one tool call and returns the text handed back to the model.
@@ -197,6 +207,8 @@ export async function qwenAgent(params: {
   onToolStart?: (info: { name: string; args: string; index: number }) => Promise<void> | void;
   /** Fired when the model is thinking (no tool call yet). */
   onThinking?: (step: number) => Promise<void> | void;
+  /** Polled between steps and tools; when true the run aborts with AgentStopped. */
+  shouldStop?: () => Promise<boolean> | boolean;
 }): Promise<{ text: string; model: string; task: QwenTask; steps: AgentStep[] }> {
   const chosen = pickModel(params.messages);
   // Vision model handles images but not tools; tools resume on the text model afterwards.
@@ -209,7 +221,10 @@ export async function qwenAgent(params: {
     : [...params.messages];
   const steps: AgentStep[] = [];
 
+  const stopped = async () => (params.shouldStop ? await params.shouldStop() : false);
+
   for (let step = 0; step < MAX_STEPS; step += 1) {
+    if (await stopped()) throw new AgentStopped(steps);
     const useTools = toolsEnabled && step < MAX_STEPS - 1;
     if (params.onThinking) await params.onThinking(step);
     let choice: QwenChoiceMessage;
@@ -239,6 +254,7 @@ export async function qwenAgent(params: {
           index: steps.length + index,
         });
       }
+      if (await stopped()) throw new AgentStopped(steps);
       const result = await params.runTool(call);
       steps.push({ name: result.name, summary: result.summary });
       if (params.onStep) await params.onStep({ name: result.name, summary: result.summary });
@@ -251,6 +267,7 @@ export async function qwenAgent(params: {
     }
   }
 
+  if (await stopped()) throw new AgentStopped(steps);
   const final = await callQwen(model, [
     ...conversation,
     { role: "user", content: "Berhenti memakai tool. Berikan kesimpulan akhir dari hasil di atas sekarang." },
