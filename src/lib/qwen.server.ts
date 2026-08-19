@@ -46,6 +46,10 @@ Sandbox tools (run_python, run_shell, install_package, write_file):
 - If a tool fails, do not give up and do not hand the command to the user: try another package,
   another tool, or another technique in the sandbox until you have a real result or a proven dead end.
 - When a file path is given to you (e.g. /home/user/uploads/...), always operate on that exact path.
+- A fenced bash block with install/run commands is NEVER an acceptable answer when a file is involved:
+  that is a sign you skipped your job. Run it yourself and paste the real output instead.
+- For an uploaded file, the deliverable is the RESULT (decrypted/decompiled source, extracted strings,
+  header dump, or the real error), never the recipe to get it.
 - Only skip the sandbox for pure conceptual/theory questions.`;
 
 export type QwenTextContent = { type: "text"; text: string };
@@ -129,6 +133,7 @@ async function callQwen(
   model: string,
   messages: QwenAnyMessage[],
   tools?: readonly unknown[],
+  toolChoice: "auto" | "required" = "auto",
 ): Promise<QwenChoiceMessage> {
   const apiKey = process.env["QWEN_API_KEY"] ?? process.env["DASHSCOPE_API_KEY"];
   if (!apiKey) throw new Error("QWEN_API_KEY is not configured");
@@ -136,7 +141,7 @@ async function callQwen(
   const body: Record<string, unknown> = { model, messages, stream: false };
   if (tools && tools.length > 0) {
     body["tools"] = tools;
-    body["tool_choice"] = "auto";
+    body["tool_choice"] = toolChoice;
   }
 
   const response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
@@ -189,6 +194,9 @@ export async function qwenChat(
 const INSTRUCTION_HINTS = [
   /\b(pip|pip3|apt|apt-get|npm|brew|luarocks)\s+install\b/i,
   /\b(jalankan|coba jalankan|silakan jalankan|ketik|run this|try running|you can run|execute this)\b/i,
+  /```(bash|sh|shell|console)/i,
+  /\b(langkah|steps?)\s*\d*\s*:?\s*(install|jalankan|run)\b/i,
+  /\b(simpan (script|kode) ini|save this script|then run|lalu jalankan)\b/i,
 ];
 
 function looksLikeInstructions(text: string): boolean {
@@ -196,7 +204,10 @@ function looksLikeInstructions(text: string): boolean {
 }
 
 /** Max model<->tool round trips before we force a final answer. */
-const MAX_STEPS = 8;
+const MAX_STEPS = 12;
+
+/** How many times we force the model back into the sandbox per run. */
+const MAX_NUDGES = 3;
 
 export type AgentStep = { name: string; summary: string };
 
@@ -225,6 +236,8 @@ export async function qwenAgent(params: {
   onThinking?: (step: number) => Promise<void> | void;
   /** Polled between steps and tools; when true the run aborts with AgentStopped. */
   shouldStop?: () => Promise<boolean> | boolean;
+  /** Forces a tool call on the first step (used when the user uploaded a file). */
+  forceFirstTool?: boolean;
 }): Promise<{ text: string; model: string; task: QwenTask; steps: AgentStep[] }> {
   const chosen = pickModel(params.messages);
   // Every routed model (text, coding and vision) supports tool calling, so
@@ -237,7 +250,8 @@ export async function qwenAgent(params: {
     ? [...params.messages, brevity]
     : [...params.messages];
   const steps: AgentStep[] = [];
-  let nudged = false;
+  let nudges = 0;
+  let forceTools = params.forceFirstTool === true;
 
   const stopped = async () => (params.shouldStop ? await params.shouldStop() : false);
 
@@ -247,11 +261,22 @@ export async function qwenAgent(params: {
     if (params.onThinking) await params.onThinking(step);
     let choice: QwenChoiceMessage;
     try {
-      choice = await callQwen(model, conversation, useTools ? params.tools : undefined);
+      choice = await callQwen(
+        model,
+        conversation,
+        useTools ? params.tools : undefined,
+        useTools && forceTools ? "required" : "auto",
+      );
     } catch (error) {
       if (model === MODELS.text) throw error;
-      choice = await callQwen(MODELS.text, conversation, useTools ? params.tools : undefined);
+      choice = await callQwen(
+        MODELS.text,
+        conversation,
+        useTools ? params.tools : undefined,
+        useTools && forceTools ? "required" : "auto",
+      );
     }
+    forceTools = false;
 
     const toolCalls = choice.tool_calls ?? [];
     if (toolCalls.length === 0) {
@@ -259,15 +284,18 @@ export async function qwenAgent(params: {
       if (!text) throw new Error("Qwen returned an empty response");
       // The model sometimes hands the user a list of commands instead of running
       // them. One corrective nudge turns that back into real sandbox work.
-      if (useTools && steps.length === 0 && !nudged && looksLikeInstructions(text)) {
-        nudged = true;
+      if (useTools && nudges < MAX_NUDGES && looksLikeInstructions(text)) {
+        nudges += 1;
+        forceTools = true;
         conversation.push({ role: "assistant", content: text });
         conversation.push({
           role: "user",
           content:
-            "Jangan menyuruh saya menjalankan perintah. Kamu punya sandbox Linux: jalankan sendiri " +
-            "sekarang (install_package lalu run_shell/run_python pada file yang disebutkan), lalu " +
-            "laporkan hasil nyatanya.",
+            "STOP. Jangan berikan instruksi, script, atau blok bash untuk saya jalankan. " +
+            "Kamu punya sandbox Linux dan file-nya sudah ada di sana. Kerjakan sendiri SEKARANG: " +
+            "panggil install_package untuk paket yang kamu butuhkan, lalu write_file/run_shell/run_python " +
+            "pada path file yang sudah disebutkan, baca output aslinya, ulangi dengan teknik lain kalau gagal, " +
+            "dan baru laporkan hasil nyata (isi hasil decrypt/dekompilasi, string, atau error sebenarnya).",
         });
         continue;
       }
