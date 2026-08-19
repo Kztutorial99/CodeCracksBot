@@ -117,3 +117,40 @@ export async function downloadFile(fileId: string): Promise<{ bytes: Uint8Array;
   }
   return { bytes: new Uint8Array(await response.arrayBuffer()), path: result.file_path };
 }
+
+/** Lightweight progress message the bot edits while it works. */
+export async function sendStatus(chatId: number, text: string): Promise<number | null> {
+  try {
+    const result = (await callTelegram("sendMessage", {
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true,
+    })) as { message_id?: number } | undefined;
+    return result?.message_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function editStatus(chatId: number, messageId: number | null, text: string) {
+  if (messageId == null) return;
+  try {
+    await callTelegram("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      disable_web_page_preview: true,
+    });
+  } catch {
+    // progress updates are best-effort (ignores "message is not modified")
+  }
+}
+
+export async function deleteStatus(chatId: number, messageId: number | null) {
+  if (messageId == null) return;
+  try {
+    await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageId });
+  } catch {
+    // best-effort
+  }
+}
