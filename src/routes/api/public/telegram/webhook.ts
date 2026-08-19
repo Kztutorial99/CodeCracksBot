@@ -16,8 +16,11 @@ import {
   deriveTelegramWebhookSecret,
   downloadFile,
   safeEqual,
+  deleteStatus,
+  editStatus,
   sendChatAction,
   sendMessage,
+  sendStatus,
 } from "@/lib/telegram.server";
 
 const WELCOME = `CodeCracks — asisten Reverse Engineering (Qwen AI)
@@ -191,6 +194,25 @@ async function handleSandboxCommand(
   return { handled: true };
 }
 
+const TOOL_LABEL: Record<string, string> = {
+  run_python: "Menjalankan kode Python",
+  run_shell: "Menjalankan perintah shell",
+  install_package: "Menginstall paket",
+  write_file: "Menulis file",
+};
+
+function firstArg(args: string): string {
+  try {
+    const parsed = JSON.parse(args) as Record<string, unknown>;
+    const value =
+      parsed["command"] ?? parsed["code"] ?? parsed["package"] ?? parsed["path"] ?? "";
+    const text = String(value).replace(/\s+/g, " ").trim();
+    return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+  } catch {
+    return "";
+  }
+}
+
 export const Route = createFileRoute("/api/public/telegram/webhook")({
   server: {
     handlers: {
@@ -256,16 +278,37 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
             userMessage,
           ];
 
-          // The model decides by itself whether to touch the sandbox.
+          // Live progress so long runs never look stuck.
+          let statusId: number | null = null;
+          const lines: string[] = [];
+          const render = async (current: string) => {
+            const body = [...lines, current].filter(Boolean).join("\n");
+            if (statusId == null) statusId = await sendStatus(chatId, body);
+            else await editStatus(chatId, statusId, body);
+          };
+
           const { text } = await qwenAgent({
             messages: conversation,
             tools: e2bEnabled() ? SANDBOX_TOOLS : [],
             runTool: (call) => executeToolCall(chatId, call),
-            onStep: async () => {
-              // Keep the "typing…" indicator alive across long tool runs.
+            onThinking: async (step) => {
               await sendChatAction(chatId);
+              if (step > 0 || lines.length > 0) await render("🧠 Menganalisa hasil…");
+            },
+            onToolStart: async ({ name, args, index }) => {
+              await sendChatAction(chatId);
+              const label = TOOL_LABEL[name] ?? name;
+              const detail = firstArg(args);
+              await render(`⚙️ ${index}. ${label}${detail ? `: ${detail}` : ""} …`);
+            },
+            onStep: async (step) => {
+              await sendChatAction(chatId);
+              const label = TOOL_LABEL[step.name] ?? step.name;
+              lines.push(`✅ ${lines.length + 1}. ${label} — ${step.summary}`.slice(0, 180));
+              await render("🧠 Menganalisa hasil…");
             },
           });
+          await deleteStatus(chatId, statusId);
           await sendMessage(chatId, text);
           await saveMessages(chatId, [
             { role: "user", content: historyText(message, "(tanpa teks)") },
