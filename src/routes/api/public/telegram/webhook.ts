@@ -9,8 +9,16 @@ import {
   runCode,
   runCommand,
 } from "@/lib/e2b.server";
-import { clearHistory, loadHistory, memoryEnabled, saveMessages } from "@/lib/memory.server";
-import { qwenAgent, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
+import {
+  clearHistory,
+  clearStop,
+  consumeStop,
+  loadHistory,
+  memoryEnabled,
+  requestStop,
+  saveMessages,
+} from "@/lib/memory.server";
+import { AgentStopped, qwenAgent, RE_SYSTEM_PROMPT, type QwenMessage } from "@/lib/qwen.server";
 import { executeToolCall, SANDBOX_TOOLS } from "@/lib/tools.server";
 import {
   deriveTelegramWebhookSecret,
@@ -44,7 +52,8 @@ Kirim apa saja untuk dianalisa:
 Contoh: "hitung CRC32 string ini", "unpack APK ini dan lihat manifestnya",
 "kenapa script ini error?" — AI langsung eksekusi sendiri di sandbox.
 
-Opsional (manual): /run /sh /pip /npm /sandbox · /reset hapus memori · /help`;
+Opsional (manual): /run /sh /pip /npm /sandbox
+/stop hentikan proses yang sedang jalan · /reset hapus memori · /help`;
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -246,6 +255,22 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           return Response.json({ ok: true });
         }
 
+        if (command === "/stop") {
+          if (!memoryEnabled()) {
+            await sendMessage(
+              chatId,
+              "Mode stop butuh memori aktif: Supabase belum dikonfigurasi di server.",
+            );
+            return Response.json({ ok: true });
+          }
+          await requestStop(chatId);
+          await sendMessage(
+            chatId,
+            "⏹️ Stop diminta. Proses berhenti setelah langkah yang sedang jalan selesai.",
+          );
+          return Response.json({ ok: true });
+        }
+
         if (command === "/reset") {
           await clearHistory(chatId);
           await sendMessage(
@@ -257,6 +282,7 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           return Response.json({ ok: true });
         }
 
+        let statusId: number | null = null;
         try {
           const sandboxResult = await handleSandboxCommand(chatId, command, argument);
           if (sandboxResult.handled) return Response.json({ ok: true });
@@ -271,6 +297,7 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
             return Response.json({ ok: true });
           }
 
+          await clearStop(chatId);
           const history = await loadHistory(chatId);
           const conversation: QwenMessage[] = [
             { role: "system", content: RE_SYSTEM_PROMPT },
@@ -279,7 +306,6 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           ];
 
           // Live progress so long runs never look stuck.
-          let statusId: number | null = null;
           const lines: string[] = [];
           const render = async (current: string) => {
             const body = [...lines, current].filter(Boolean).join("\n");
@@ -290,6 +316,7 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           const { text } = await qwenAgent({
             messages: conversation,
             tools: e2bEnabled() ? SANDBOX_TOOLS : [],
+            shouldStop: () => consumeStop(chatId),
             runTool: (call) => executeToolCall(chatId, call),
             onThinking: async (step) => {
               await sendChatAction(chatId);
@@ -315,6 +342,20 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
             { role: "assistant", content: text },
           ]);
         } catch (error) {
+          try {
+            await deleteStatus(chatId, statusId);
+          } catch {
+            // status message already gone
+          }
+          if (error instanceof AgentStopped) {
+            const done = error.steps.length
+              ? `\n\nLangkah yang sempat selesai:\n${error.steps
+                  .map((s, i) => `${i + 1}. ${s.name} — ${s.summary}`.slice(0, 180))
+                  .join("\n")}`
+              : "";
+            await sendMessage(chatId, `⏹️ Dihentikan atas permintaan kamu.${done}`);
+            return Response.json({ ok: true, stopped: true });
+          }
           console.error("CodeCracks webhook error", error);
           const detail = error instanceof Error ? error.message : String(error);
           try {
