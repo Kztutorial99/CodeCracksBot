@@ -11,7 +11,7 @@ export default defineConfig({
   // Locally / on Lovable it keeps the default Cloudflare target.
   // maxDuration: sandbox commands and package installs need more than the default limit.
   ...(process.env["VERCEL"]
-    ? ({ nitro: { preset: "vercel", vercel: { functions: { maxDuration: 60 } } } } as unknown as Record<
+    ? ({ nitro: { preset: "vercel", vercel: { functions: { maxDuration: 300 } } } } as unknown as Record<
         string,
         unknown
       >)
