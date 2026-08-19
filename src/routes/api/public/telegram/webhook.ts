@@ -164,6 +164,36 @@ async function buildUserMessage(
   return caption ? { role: "user", content: caption } : null;
 }
 
+/**
+ * Telegram service updates (pin/unpin, member join/leave, chat title change)
+ * arrive as plain messages with only a marker field. They are never user input.
+ */
+function isServiceMessage(message: TelegramMessage): boolean {
+  const m = message as unknown as Record<string, unknown>;
+  const markers = [
+    "pinned_message",
+    "new_chat_members",
+    "left_chat_member",
+    "new_chat_title",
+    "new_chat_photo",
+    "delete_chat_photo",
+    "group_chat_created",
+    "supergroup_chat_created",
+    "channel_chat_created",
+    "message_auto_delete_timer_changed",
+    "migrate_to_chat_id",
+    "migrate_from_chat_id",
+    "video_chat_started",
+    "video_chat_ended",
+    "video_chat_participants_invited",
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+  ];
+  return markers.some((key) => m[key] !== undefined);
+}
+
 /** Plain-text version of a message, used for the stored conversation history. */
 function historyText(message: TelegramMessage, fallback: string): string {
   const caption = (message.text ?? message.caption ?? "").trim();
@@ -285,6 +315,24 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           return Response.json({ ok: true, ignored: true });
         }
 
+        // Telegram echoes service events (pinned message, join/leave, pin
+        // removed...) as normal updates. They carry no text, so without this
+        // guard every pinned status message made the bot answer with the
+        // "kirim teks/kode/file" hint on each turn.
+        if (isServiceMessage(message)) {
+          return Response.json({ ok: true, ignored: "service" });
+        }
+
+        // Nothing usable at all (sticker, poll, voice note, ...): stay quiet
+        // instead of spamming the hint.
+        const hasContent =
+          Boolean((message.text ?? message.caption ?? "").trim()) ||
+          Boolean(message.document) ||
+          Boolean(message.photo?.length);
+        if (!hasContent) {
+          return Response.json({ ok: true, ignored: "empty" });
+        }
+
         const raw = (message.text ?? "").trim();
         const command = raw.split(/\s+/)[0]?.toLowerCase().split("@")[0] ?? "";
         const argument = raw.slice(command.length).trim();
@@ -396,9 +444,11 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
           await sendChatAction(chatId);
           const userMessage = await buildUserMessage(chatId, message);
           if (!userMessage) {
+            // Only reachable for an oversized upload now; empty updates are
+            // filtered out before the run starts.
             await sendMessage(
               chatId,
-              "Kirim teks, kode, hex dump, gambar, atau file (maks 5 MB) yang mau dianalisa.",
+              "File-nya terlalu besar (maks 5 MB, gambar 4 MB). Kirim versi yang lebih kecil atau potongannya.",
             );
             return Response.json({ ok: true });
           }
