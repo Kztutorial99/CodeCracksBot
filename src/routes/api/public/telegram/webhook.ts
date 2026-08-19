@@ -46,30 +46,31 @@ import {
   unpinMessage,
 } from "@/lib/telegram.server";
 
-const WELCOME = `CodeCracks — asisten Reverse Engineering (Qwen AI)
+const WELCOME = `**CodeCracks AI**
+Asisten AI untuk reverse engineering, analisis kode, dan eksplorasi binary.
 
-Ngobrol biasa saja. Tidak perlu perintah apa pun.
+**Mulai di sini**
+Kirim pertanyaan, potongan kode, screenshot, atau file. Tulis seperti sedang ngobrol biasa — tidak perlu perintah khusus.
 
-AI-nya punya sandbox Linux sendiri dan akan memakainya otomatis kalau memang
-perlu — menjalankan kode, install paket, decode/unpack, cek header binary,
-disassemble, uji script — lalu menjawab dari hasil yang benar-benar dijalankan.
+**Yang bisa dibantu**
+- Menganalisis kode, disassembly, hex dump, dan log debugger
+- Membaca screenshot dari IDA, Ghidra, x64dbg, atau aplikasi lain
+- Menjalankan kode, decode/unpack, cek header binary, dan menguji script di sandbox Linux
+- Menganalisis file .txt, .c, .py, .js, .asm, .bin, .exe, .elf, .dex, atau .apk (maks. 5 MB)
 
-Model juga dipilih otomatis:
-- teks: qwen3.8-max
-- kode & binary: qwen3-coder-plus
-- gambar/screenshot: qwen3-vl-flash
+**Contoh pertanyaan**
+- \`Hitung CRC32 dari string ini\`
+- \`Unpack APK ini dan cek manifestnya\`
+- \`Kenapa script Python ini error?\`
 
-Kirim apa saja untuk dianalisa:
-- pertanyaan RE, snippet kode, disasm, hex dump, log debugger
-- screenshot IDA/Ghidra/x64dbg atau UI aplikasi
-- file .txt .c .py .js .asm .bin .exe .elf .dex .apk (maks ~5 MB)
+Model dan sandbox dipilih otomatis sesuai kebutuhan analisis.
 
-Contoh: "hitung CRC32 string ini", "unpack APK ini dan lihat manifestnya",
-"kenapa script ini error?" — AI langsung eksekusi sendiri di sandbox.
+**Perintah cepat**
+\`/status\` cek proses · \`/stop\` hentikan proses
+\`/reset\` hapus memori · \`/run\` jalankan kode
+\`/sh\` shell · \`/pip\` atau \`/npm\` install paket
 
-Opsional (manual): /run /sh /pip /npm /sandbox
-/status lihat bot idle atau sedang jalan · /stop hentikan proses
-/reset hapus memori · /help`;
+Kirim pesan pertamamu untuk mulai.`;
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
