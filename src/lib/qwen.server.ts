@@ -193,6 +193,10 @@ export async function qwenAgent(params: {
   tools: readonly unknown[];
   runTool: (call: QwenToolCall) => Promise<{ id: string; name: string; summary: string; output: string }>;
   onStep?: (step: AgentStep) => Promise<void> | void;
+  /** Fired right before a tool runs, so the UI can show live progress. */
+  onToolStart?: (info: { name: string; args: string; index: number }) => Promise<void> | void;
+  /** Fired when the model is thinking (no tool call yet). */
+  onThinking?: (step: number) => Promise<void> | void;
 }): Promise<{ text: string; model: string; task: QwenTask; steps: AgentStep[] }> {
   const chosen = pickModel(params.messages);
   // Vision model handles images but not tools; tools resume on the text model afterwards.
@@ -207,6 +211,7 @@ export async function qwenAgent(params: {
 
   for (let step = 0; step < MAX_STEPS; step += 1) {
     const useTools = toolsEnabled && step < MAX_STEPS - 1;
+    if (params.onThinking) await params.onThinking(step);
     let choice: QwenChoiceMessage;
     try {
       choice = await callQwen(model, conversation, useTools ? params.tools : undefined);
@@ -224,7 +229,16 @@ export async function qwenAgent(params: {
 
     conversation.push({ role: "assistant", content: choice.content ?? "", tool_calls: toolCalls });
 
+    let index = 0;
     for (const call of toolCalls) {
+      index += 1;
+      if (params.onToolStart) {
+        await params.onToolStart({
+          name: call.function?.name ?? "tool",
+          args: call.function?.arguments ?? "",
+          index: steps.length + index,
+        });
+      }
       const result = await params.runTool(call);
       steps.push({ name: result.name, summary: result.summary });
       if (params.onStep) await params.onStep({ name: result.name, summary: result.summary });
