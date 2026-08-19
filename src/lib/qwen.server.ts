@@ -17,6 +17,10 @@ Scope: static/dynamic analysis, disassembly (x86/x64/ARM), decompiler output cle
 and file-format analysis, crackme/CTF style challenges, debugging with GDB/x64dbg/Frida/IDA/Ghidra/radare2.
 
 Rules:
+- MATCH THE QUESTION'S SIZE. Short/simple message (greeting, small talk, yes-no, one fact) -> answer in
+  1-2 short sentences, no headings, no bullet lists, no preamble, no "let me explain", no summary at the end.
+  Only go long when the user actually asks for depth (analysis, tutorial, full code, "jelaskan detail").
+- Never pad: no restating the question, no filler intro/outro, no offering extra topics unless asked.
 - Answer concisely and technically. Use short sections and code blocks.
 - Output is rendered as Telegram HTML by the bot: write plain markdown, never raw HTML tags.
 - ALWAYS put code in triple-backtick fenced blocks with a language tag (python, c, bash, x86asm, json) so Telegram syntax-highlights it; use the text tag for hex dumps and logs.
@@ -75,6 +79,25 @@ export function pickModel(messages: QwenMessage[]): { model: string; task: QwenT
     return { model: MODELS.coding, task: "coding" };
   }
   return { model: MODELS.text, task: "text" };
+}
+
+/** Adapts answer length to the user's message: short in -> short out. */
+export function lengthDirective(messages: QwenMessage[]): QwenMessage | null {
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  if (!lastUser) return null;
+  if (hasImage(lastUser.content)) return null;
+  const text = textOf(lastUser.content).trim();
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const wantsDetail =
+    /(jelaskan|detail|lengkap|panjang|step by step|tutorial|analisa|analisis|explain|why|kenapa|bagaimana|how do|write|buatkan|bikin|code|script)/i.test(
+      text,
+    );
+  if (wantsDetail || words > 25 || text.includes("```")) return null;
+  const limit = words <= 4 ? "maksimal 1 kalimat" : "maksimal 2-3 kalimat";
+  return {
+    role: "system",
+    content: `Pesan user pendek. Jawab ${limit}, langsung ke inti, tanpa heading, tanpa bullet, tanpa basa-basi pembuka/penutup.`,
+  };
 }
 
 export type QwenToolCall = {
@@ -136,13 +159,16 @@ export async function qwenChat(
     ? { model: MODELS[options.task], task: options.task }
     : pickModel(messages);
 
+  const brevity = lengthDirective(messages);
+  const finalMessages = brevity ? [...messages, brevity] : messages;
+
   const attempts: { model: string; task: QwenTask }[] = [chosen];
   if (chosen.task !== "text") attempts.push({ model: MODELS.text, task: "text" });
 
   let lastError: unknown;
   for (const attempt of attempts) {
     try {
-      const choice = await callQwen(attempt.model, messages);
+      const choice = await callQwen(attempt.model, finalMessages);
       const text = (choice.content ?? "").trim();
       if (!text) throw new Error("Qwen returned an empty response");
       return { text, model: attempt.model, task: attempt.task };
@@ -173,7 +199,10 @@ export async function qwenAgent(params: {
   const toolsEnabled = chosen.task !== "vision" && params.tools.length > 0;
   const model = chosen.model;
 
-  const conversation: QwenAnyMessage[] = [...params.messages];
+  const brevity = lengthDirective(params.messages);
+  const conversation: QwenAnyMessage[] = brevity
+    ? [...params.messages, brevity]
+    : [...params.messages];
   const steps: AgentStep[] = [];
 
   for (let step = 0; step < MAX_STEPS; step += 1) {
