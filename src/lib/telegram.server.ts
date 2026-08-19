@@ -1,4 +1,8 @@
 import { createHash, timingSafeEqual } from "crypto";
+import {
+  markdownToPlainText,
+  markdownToTelegramHtmlChunks,
+} from "@/lib/markdown-telegram";
 
 const GATEWAY_URL = "https://connector-gateway.lovable.dev/telegram";
 
@@ -60,25 +64,35 @@ async function callTelegram(method: string, body: unknown) {
   return data.result;
 }
 
-const MAX_LEN = 3800;
+const MAX_LEN = 3500;
 
-export async function sendMessage(chatId: number, text: string) {
-  const chunks: string[] = [];
-  let rest = text;
-  while (rest.length > MAX_LEN) {
-    let cut = rest.lastIndexOf("\n", MAX_LEN);
-    if (cut < MAX_LEN / 2) cut = MAX_LEN;
-    chunks.push(rest.slice(0, cut));
-    rest = rest.slice(cut);
-  }
-  chunks.push(rest);
-
-  for (const chunk of chunks) {
+async function sendChunk(chatId: number, html: string, plain: string) {
+  try {
     await callTelegram("sendMessage", {
       chat_id: chatId,
-      text: chunk,
+      text: html,
+      parse_mode: "HTML",
       disable_web_page_preview: true,
     });
+  } catch (error) {
+    console.error("HTML send failed, falling back to plain text", error);
+    await callTelegram("sendMessage", {
+      chat_id: chatId,
+      text: plain,
+      disable_web_page_preview: true,
+    });
+  }
+}
+
+/**
+ * Sends markdown from the model as Telegram HTML so fenced code blocks are
+ * rendered as highlighted `pre`/`code` entities (with language) in clients.
+ */
+export async function sendMessage(chatId: number, text: string) {
+  const chunks = markdownToTelegramHtmlChunks(text, MAX_LEN);
+  const plainFallback = markdownToPlainText(text);
+  for (const chunk of chunks) {
+    await sendChunk(chatId, chunk, plainFallback.slice(0, MAX_LEN));
   }
 }
 
