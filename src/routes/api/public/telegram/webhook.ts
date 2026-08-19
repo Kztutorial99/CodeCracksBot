@@ -444,6 +444,8 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
             messages: conversation,
             tools: e2bEnabled() ? SANDBOX_TOOLS : [],
             shouldStop: () => consumeStop(chatId),
+            // A file in the sandbox means the answer must come from running it.
+            forceFirstTool: uploads.length > 0,
             runTool: (call) => executeToolCall(chatId, call),
             onThinking: async (step) => {
               await sendChatAction(chatId);
