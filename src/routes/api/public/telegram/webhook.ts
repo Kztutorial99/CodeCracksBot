@@ -34,43 +34,77 @@ import {
 } from "@/lib/qwen.server";
 import { executeToolCall, SANDBOX_TOOLS } from "@/lib/tools.server";
 import {
+  answerCallbackQuery,
   deriveTelegramWebhookSecret,
   downloadFile,
+  editMessageWithKeyboard,
   safeEqual,
   deleteStatus,
   editStatus,
   pinMessage,
   sendChatAction,
   sendMessage,
+  sendMessageWithKeyboard,
   sendStatus,
   unpinMessage,
 } from "@/lib/telegram.server";
 
-const WELCOME = `**CodeCracks AI**
-Asisten AI untuk reverse engineering, analisis kode, dan eksplorasi binary.
+type InlineButton = { text: string; callback_data: string };
 
-**Mulai di sini**
-Kirim pertanyaan, potongan kode, screenshot, atau file. Tulis seperti sedang ngobrol biasa — tidak perlu perintah khusus.
+const MENU_KB: InlineButton[][] = [
+  [{ text: "📋 Fitur", callback_data: "menu_features" }],
+  [{ text: "⌨️ Perintah", callback_data: "menu_commands" }],
+  [{ text: "💬 Bantuan", callback_data: "menu_help" }],
+];
 
-**Yang bisa dibantu**
-- Menganalisis kode, disassembly, hex dump, dan log debugger
-- Membaca screenshot dari IDA, Ghidra, x64dbg, atau aplikasi lain
-- Menjalankan kode, decode/unpack, cek header binary, dan menguji script di sandbox Linux
-- Menganalisis file .txt, .c, .py, .js, .asm, .bin, .exe, .elf, .dex, atau .apk (maks. 5 MB)
+const BACK_KB: InlineButton[][] = [
+  [{ text: "◀️ Menu Utama", callback_data: "menu_back" }],
+];
 
-**Contoh pertanyaan**
-- \`Hitung CRC32 dari string ini\`
-- \`Unpack APK ini dan cek manifestnya\`
-- \`Kenapa script Python ini error?\`
+const WELCOME_TEXT = [
+  "👋 <b>CodeCracks AI</b>",
+  "",
+  "Asisten AI untuk reverse engineering,",
+  "analisis kode, dan eksplorasi binary.",
+  "",
+  "Kirim pertanyaan, kode, screenshot,",
+  "atau file untuk mulai.",
+].join("\n");
 
-Model dan sandbox dipilih otomatis sesuai kebutuhan analisis.
+const FEATURES_TEXT = [
+  "📋 <b>Fitur</b>",
+  "",
+  "• Analisis kode &amp; disassembly",
+  "• Baca screenshot IDA, Ghidra, x64dbg",
+  "• Jalankan kode di sandbox Linux",
+  "• Decode, unpack, cek header binary",
+  "• File: .c .py .js .asm .bin",
+  "  .exe .elf .dex .apk (maks 5 MB)",
+].join("\n");
 
-**Perintah cepat**
-\`/status\` cek proses · \`/stop\` hentikan proses
-\`/reset\` hapus memori · \`/run\` jalankan kode
-\`/sh\` shell · \`/pip\` atau \`/npm\` install paket
+const COMMANDS_TEXT = [
+  "⌨️ <b>Perintah</b>",
+  "",
+  "/status — cek proses",
+  "/stop — hentikan proses",
+  "/reset — hapus memori",
+  "/run — jalankan kode",
+  "/sh — shell command",
+  "/pip / /npm — install paket",
+].join("\n");
 
-Kirim pesan pertamamu untuk mulai.`;
+const HELP_TEXT = [
+  "💬 <b>Cara Pakai</b>",
+  "",
+  "Tulis pertanyaan seperti ngobrol biasa.",
+  "Kirim kode, screenshot, atau file —",
+  "bot otomatis analisa.",
+  "",
+  "<b>Contoh:</b>",
+  "• Hitung CRC32 dari string ini",
+  "• Unpack APK ini dan cek manifest",
+  "• Kenapa script Python ini error?",
+].join("\n");
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -79,6 +113,7 @@ type TelegramUpdate = {
   update_id?: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 };
 
 type TelegramMessage = {
@@ -87,6 +122,12 @@ type TelegramMessage = {
   caption?: string;
   document?: { file_id: string; file_name?: string; file_size?: number; mime_type?: string };
   photo?: { file_id: string; file_size?: number }[];
+};
+
+type TelegramCallbackQuery = {
+  id: string;
+  data?: string;
+  message?: { message_id: number; chat: { id: number } };
 };
 
 function toDataUrl(bytes: Uint8Array, path: string): string {
@@ -310,6 +351,42 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
         }
 
         const update = (await request.json()) as TelegramUpdate;
+
+        // --- Callback query (inline button press) ---
+        const callbackQuery = update.callback_query;
+        if (callbackQuery) {
+          const cbId = callbackQuery.id;
+          const cbChatId = callbackQuery.message?.chat?.id;
+          const cbMsgId = callbackQuery.message?.message_id;
+          const data = callbackQuery.data ?? "";
+
+          if (cbChatId && cbMsgId) {
+            switch (data) {
+              case "menu_features":
+                await answerCallbackQuery(cbId);
+                await editMessageWithKeyboard(cbChatId, cbMsgId, FEATURES_TEXT, BACK_KB);
+                break;
+              case "menu_commands":
+                await answerCallbackQuery(cbId);
+                await editMessageWithKeyboard(cbChatId, cbMsgId, COMMANDS_TEXT, BACK_KB);
+                break;
+              case "menu_help":
+                await answerCallbackQuery(cbId);
+                await editMessageWithKeyboard(cbChatId, cbMsgId, HELP_TEXT, BACK_KB);
+                break;
+              case "menu_back":
+                await answerCallbackQuery(cbId);
+                await editMessageWithKeyboard(cbChatId, cbMsgId, WELCOME_TEXT, MENU_KB);
+                break;
+              default:
+                await answerCallbackQuery(cbId);
+            }
+          } else {
+            await answerCallbackQuery(cbId);
+          }
+          return Response.json({ ok: true });
+        }
+
         const message = update.message ?? update.edited_message;
         const chatId = message?.chat?.id;
         if (!message || typeof chatId !== "number") {
@@ -339,7 +416,7 @@ export const Route = createFileRoute("/api/public/telegram/webhook")({
         const argument = raw.slice(command.length).trim();
 
         if (command === "/start" || command === "/help") {
-          await sendMessage(chatId, WELCOME);
+          await sendMessageWithKeyboard(chatId, WELCOME_TEXT, MENU_KB);
           return Response.json({ ok: true });
         }
 

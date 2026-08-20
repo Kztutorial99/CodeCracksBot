@@ -177,3 +177,50 @@ export async function unpinMessage(chatId: number, messageId: number | null) {
     // best-effort
   }
 }
+
+type InlineButton = { text: string; callback_data: string };
+
+export async function sendMessageWithKeyboard(
+  chatId: number,
+  text: string,
+  keyboard: InlineButton[][],
+) {
+  await callTelegram("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
+export async function editMessageWithKeyboard(
+  chatId: number,
+  messageId: number,
+  text: string,
+  keyboard: InlineButton[][],
+) {
+  try {
+    await callTelegram("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  } catch {
+    // best-effort (ignores "message is not modified")
+  }
+}
+
+export async function answerCallbackQuery(callbackQueryId: string, text?: string) {
+  try {
+    await callTelegram("answerCallbackQuery", {
+      callback_query_id: callbackQueryId,
+      ...(text ? { text } : {}),
+    });
+  } catch {
+    // best-effort
+  }
+}
